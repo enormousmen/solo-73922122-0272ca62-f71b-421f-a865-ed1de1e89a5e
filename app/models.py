@@ -33,6 +33,9 @@ MAX_ZONES = 8
 MAX_RECORDS_PER_ZONE = 256
 MAX_REQUIRED_DOMAINS = 64
 
+MIN_UDP_PAYLOAD = 512
+MAX_UDP_PAYLOAD = 65535
+
 
 def normalize_name(name: str) -> str:
     """Canonical comparison form: lowercase, no trailing root dot."""
@@ -79,7 +82,7 @@ class Record(BaseModel):
         return validate_name(v, "DNS owner name")
 
     @model_validator(mode="after")
-    def _valid_value(self) -> "Record":
+    def _valid_value(self) -> Record:
         if self.type == "A":
             try:
                 ipaddress.IPv4Address(self.value)
@@ -93,6 +96,68 @@ class Record(BaseModel):
             self.value = validate_name(
                 self.value, f"CNAME target of {self.name!r}"
             )
+        return self
+
+
+def _validate_rrsets(zone_name: str, field: str, records: list[Record]) -> None:
+    """Apply the authoritative-DNS rules shared by plan zones and snapshots."""
+    owned: dict[str, tuple[str, set[str]]] = {}
+    for rec in records:
+        if not in_zone(rec.name, zone_name):
+            raise ValueError(
+                f"{field}: {rec.name!r} is not owned by zone {zone_name!r} "
+                "(zones must be self-contained)"
+            )
+        if rec.name == zone_name and rec.type == "CNAME":
+            raise ValueError(
+                f"{field}: CNAME at the zone apex {zone_name!r} is not "
+                "valid in authoritative DNS (the apex holds SOA/NS)"
+            )
+        previous = owned.get(rec.name)
+        if previous is not None and previous[0] != rec.type:
+            raise ValueError(
+                f"{field}: {rec.name!r} has both A and CNAME records, "
+                "which authoritative DNS forbids"
+            )
+        targets = previous[1] if previous else set()
+        if rec.type == "CNAME":
+            targets.add(rec.value)
+            if len(targets) > 1:
+                raise ValueError(
+                    f"{field}: {rec.name!r} has conflicting CNAME targets"
+                )
+        owned[rec.name] = (rec.type, targets)
+
+    # A name holding a CNAME cannot also have names below it.
+    cnames = [n for n, (t, _targets) in owned.items() if t == "CNAME"]
+    for cname in cnames:
+        suffix = "." + cname
+        if any(other != cname and other.endswith(suffix) for other in owned):
+            raise ValueError(
+                f"{field}: {cname!r} is a CNAME but also has names below "
+                "it; authoritative DNS forbids that"
+            )
+
+
+class ZoneSnapshot(BaseModel):
+    """One authoritative zone at a single point in time.
+
+    This is the input shape for the offline query/encoding API: the records
+    submitted are the zone's *current* authoritative data, with no old/new
+    pair and no cutover semantics.
+    """
+
+    name: str
+    records: list[Record] = Field(default_factory=list, max_length=MAX_RECORDS_PER_ZONE)
+
+    @field_validator("name")
+    @classmethod
+    def _valid_zone(cls, v: str) -> str:
+        return validate_name(v, "zone name")
+
+    @model_validator(mode="after")
+    def _check_records(self) -> ZoneSnapshot:
+        _validate_rrsets(self.name, "records", self.records)
         return self
 
 
@@ -118,48 +183,86 @@ class Zone(BaseModel):
         return validate_name(v, "zone name")
 
     @model_validator(mode="after")
-    def _check_zone_records(self) -> "Zone":
-        self._check_rrset("records", self.records)
-        self._check_rrset("new_records", self.new_records)
+    def _check_zone_records(self) -> Zone:
+        _validate_rrsets(self.name, "records", self.records)
+        _validate_rrsets(self.name, "new_records", self.new_records)
         return self
 
-    def _check_rrset(self, field: str, records: list[Record]) -> None:
-        owned: dict[str, tuple[str, set[str]]] = {}
-        for rec in records:
-            if not in_zone(rec.name, self.name):
-                raise ValueError(
-                    f"{field}: {rec.name!r} is not owned by zone {self.name!r} "
-                    "(zones must be self-contained)"
-                )
-            if rec.name == self.name and rec.type == "CNAME":
-                raise ValueError(
-                    f"{field}: CNAME at the zone apex {self.name!r} is not "
-                    "valid in authoritative DNS (the apex holds SOA/NS)"
-                )
-            previous = owned.get(rec.name)
-            if previous is not None and previous[0] != rec.type:
-                raise ValueError(
-                    f"{field}: {rec.name!r} has both A and CNAME records, "
-                    "which authoritative DNS forbids"
-                )
-            targets = previous[1] if previous else set()
-            if rec.type == "CNAME":
-                targets.add(rec.value)
-                if len(targets) > 1:
-                    raise ValueError(
-                        f"{field}: {rec.name!r} has conflicting CNAME targets"
-                    )
-            owned[rec.name] = (rec.type, targets)
 
-        # A name holding a CNAME cannot also have names below it.
-        cnames = [n for n, (t, _targets) in owned.items() if t == "CNAME"]
-        for cname in cnames:
-            suffix = "." + cname
-            if any(other != cname and other.endswith(suffix) for other in owned):
-                raise ValueError(
-                    f"{field}: {cname!r} is a CNAME but also has names below "
-                    "it; authoritative DNS forbids that"
-                )
+def validate_zone_topology(names: list[str]) -> None:
+    """Reject duplicate and nested zones: every name has exactly one owner."""
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate zone names")
+    for a in names:
+        for b in names:
+            if a != b and in_zone(a, b):
+                raise ValueError(f"zones must be non-nested: {a!r} is inside {b!r}")
+
+
+class QueryRequest(BaseModel):
+    """Offline, single-question query against submitted zone snapshots.
+
+    ``zones`` are the authoritative zones *as they are now*; there is no
+    old/new pair and hence no cutover planning.  The resolver still runs
+    cache-less and still refuses to follow a CNAME out of the submitted zones,
+    exactly like ``POST /plan`` does in its initial state.
+
+    ``link_udp_size`` is the largest DNS message the path can carry over UDP
+    (the value an operator is about to lower).  ``edns_udp_size`` is the
+    client's advertised EDNS(0) payload size, if the request carries EDNS.
+    The UDP budget is ``min(link_udp_size, client size)`` where the client
+    size defaults to 512 bytes when EDNS is absent.
+    """
+
+    zones: list[ZoneSnapshot] = Field(min_length=1, max_length=MAX_ZONES)
+    qname: str
+    qtype: Literal["A"] = "A"
+    qclass: Literal["IN"] = "IN"
+    # The link may be tuned below the classic 512-byte limit; that is exactly
+    # the case the budget report must catch, so no 512 floor is enforced here.
+    link_udp_size: int = Field(ge=1, le=MAX_UDP_PAYLOAD)
+    # EDNS(0) payload sizes below 512 are not meaningful (RFC 6891 section
+    # 6.2.5); reject them rather than silently reinterpreting the caller.
+    edns_udp_size: int | None = Field(
+        default=None, ge=MIN_UDP_PAYLOAD, le=MAX_UDP_PAYLOAD
+    )
+
+    @field_validator("qname")
+    @classmethod
+    def _valid_qname(cls, v: str) -> str:
+        return validate_name(v, "query name")
+
+    @field_validator("qtype", "qclass", mode="before")
+    @classmethod
+    def _normalise_upper(cls, v: object) -> object:
+        return v.strip().upper() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _check_topology(self) -> QueryRequest:
+        names = [z.name for z in self.zones]
+        validate_zone_topology(names)
+        if zone_covering(self.qname, names) is None:
+            raise ValueError(
+                f"query name {self.qname!r} is not inside any submitted zone; "
+                "the resolver only has authoritative data for submitted zones"
+            )
+        return self
+
+    @property
+    def has_edns(self) -> bool:
+        return self.edns_udp_size is not None
+
+    @property
+    def client_udp_size(self) -> int:
+        """Client's UDP receive limit; the classic 512 bytes without EDNS."""
+        if self.edns_udp_size is None:
+            return MIN_UDP_PAYLOAD
+        return self.edns_udp_size
+
+    @property
+    def udp_budget(self) -> int:
+        """Effective UDP budget: min(link limit, client limit)."""
+        return min(self.link_udp_size, self.client_udp_size)
 
 
 class PlanRequest(BaseModel):
@@ -177,16 +280,9 @@ class PlanRequest(BaseModel):
         return out
 
     @model_validator(mode="after")
-    def _check_topology(self) -> "PlanRequest":
+    def _check_topology(self) -> PlanRequest:
         names = [z.name for z in self.zones]
-        if len(set(names)) != len(names):
-            raise ValueError("duplicate zone names")
-        for a in names:
-            for b in names:
-                if a != b and in_zone(a, b):
-                    raise ValueError(
-                        f"zones must be non-nested: {a!r} is inside {b!r}"
-                    )
+        validate_zone_topology(names)
         for domain in self.required_domains:
             if zone_covering(domain, names) is None:
                 raise ValueError(

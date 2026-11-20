@@ -46,6 +46,10 @@ class Resolution:
     category: FailureCategory | None = None
     detail: str | None = None
     message: str = ""
+    # Actual authoritative records that answered the query, in resolution
+    # order: one CNAME per alias hop followed by the final A RRset.  Used by
+    # the offline encoder; never serialised directly.
+    records: list[Record] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -108,6 +112,7 @@ class Resolver:
 
     def resolve(self, domain: str, released: frozenset[int]) -> Resolution:
         trace: list[TraceEntry] = []
+        answers: list[Record] = []
         visited: set[str] = set()
         name = domain
         for _ in range(MAX_CNAME_HOPS + 1):
@@ -160,6 +165,7 @@ class Resolver:
                         name=name, zone=zone_name, outcome="cname", target=cname.value
                     )
                 )
+                answers.append(cname)
                 name = cname.value
                 continue
 
@@ -167,7 +173,20 @@ class Resolver:
             trace.append(
                 TraceEntry(name=name, zone=zone_name, outcome="a", addresses=addresses)
             )
-            return Resolution(domain=domain, addresses=addresses, trace=trace)
+            # The A RRset is emitted as one unit, de-duplicated by address.  If
+            # the same address is submitted more than once, keep the record
+            # with the lowest TTL so the encoded RRset never overstates it.
+            by_address: dict[str, Record] = {}
+            for rec in records:
+                if rec.type != "A":
+                    continue
+                kept = by_address.get(rec.value)
+                if kept is None or rec.ttl < kept.ttl:
+                    by_address[rec.value] = rec
+            answers.extend(by_address[value] for value in sorted(by_address))
+            return Resolution(
+                domain=domain, addresses=addresses, trace=trace, records=answers
+            )
 
         trace.append(TraceEntry(name=name, zone=None, outcome="too_long"))
         return Resolution(

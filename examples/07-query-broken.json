@@ -1,0 +1,14 @@
+{
+  "zones": [
+    {
+      "name": "a.example.com",
+      "records": [
+        {"name": "www.a.example.com", "type": "CNAME", "value": "svc.partner.example.org", "ttl": 60}
+      ]
+    }
+  ],
+  "qname": "www.a.example.com",
+  "qtype": "A",
+  "qclass": "IN",
+  "link_udp_size": 512
+}

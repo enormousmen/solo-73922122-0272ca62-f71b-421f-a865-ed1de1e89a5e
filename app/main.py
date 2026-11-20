@@ -7,20 +7,25 @@ from typing import Any
 from fastapi import FastAPI
 
 from . import __version__
-from .models import PlanRequest
-from .schemas import HealthResponse, PlanResponse
+from .models import PlanRequest, QueryRequest
+from .query import build_query_response
+from .schemas import HealthResponse, PlanResponse, QueryResponse
 from .service import build_plan
 
 app = FastAPI(
     title="跨区 DNS 变更发布顺序规划器",
     version=__version__,
-    summary="为内网 DNS 值班员推算整区切换的安全顺序",
+    summary="为内网 DNS 值班员推算整区切换的安全顺序，并核对 UDP 预算",
     description=(
         "提交最多 8 个互不嵌套的权威区的新旧 A/CNAME 记录，以及必须持续可解析的"
         "业务域名。服务按无缓存权威记录推演每个整区切换后的状态：\n\n"
         "* 若存在安全顺序，返回逐步发布顺序，并附每一步前后的解析结果；\n"
         "* 若现状已无法解析，返回故障链路（缺记录 / 成环 / 链出权威区 / 链过长）；\n"
         "* 若无安全顺序，返回最大安全前缀，以及剩余每个区发布后会断在哪条解析链上。\n\n"
+        "`POST /query` 是离线单查询接口：提交各区当前的权威快照、一个 A/IN 查询名、"
+        "链路允许的 DNS 消息字节数，以及可选的 EDNS UDP 上限；返回启用名称压缩的"
+        "完整应答与按 UDP 预算截断的应答（Base64 与字节数），供调低内网 UDP 上限前"
+        "确认业务查询是否会转 TCP。\n\n"
         "假设：每个区一次整区切换，区内没有新旧共存的中间态；解析无缓存；"
         "CNAME 链离开已提交的区即视为无法确认（可把外部区按新旧相同一并提交）。"
     ),
@@ -44,3 +49,21 @@ def healthz() -> HealthResponse:
 )
 def plan(request: PlanRequest) -> dict[str, Any]:
     return build_plan(request)
+
+
+@app.post(
+    "/query",
+    response_model=QueryResponse,
+    response_model_exclude_none=True,
+    summary="离线核对单条 A/IN 查询的 UDP 预算",
+    responses={
+        200: {
+            "description": (
+                "查询可解析时返回完整应答与 UDP 应答；无法解析时返回故障链路"
+            )
+        },
+        422: {"description": "请求校验失败（区/快照/查询名/UDP 大小不合法）"},
+    },
+)
+def query(request: QueryRequest) -> dict[str, Any]:
+    return build_query_response(request)

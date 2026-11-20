@@ -1,0 +1,24 @@
+{
+  "zones": [
+    {
+      "name": "a.example.com",
+      "records": [
+        {"name": "www.a.example.com", "type": "CNAME", "value": "svc.b.example.com", "ttl": 60},
+        {"name": "api.a.example.com", "type": "CNAME", "value": "www.a.example.com", "ttl": 60},
+        {"name": "a.example.com", "type": "A", "value": "10.20.0.10", "ttl": 60}
+      ]
+    },
+    {
+      "name": "b.example.com",
+      "records": [
+        {"name": "svc.b.example.com", "type": "A", "value": "10.20.1.10", "ttl": 60},
+        {"name": "svc.b.example.com", "type": "A", "value": "10.20.1.11", "ttl": 60},
+        {"name": "svc.b.example.com", "type": "A", "value": "10.20.1.12", "ttl": 60}
+      ]
+    }
+  ],
+  "qname": "api.a.example.com",
+  "qtype": "A",
+  "qclass": "IN",
+  "link_udp_size": 512
+}
